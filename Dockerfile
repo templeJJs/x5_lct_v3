@@ -1,14 +1,16 @@
-# Используем официальный Python образ
-FROM python:3.10-slim
+# Используем образ с уже установленными ML библиотеками
+FROM python:3.10
 
 # Устанавливаем рабочую директорию
 WORKDIR /app
 
-# Устанавливаем системные зависимости
+# Устанавливаем только нужные системные зависимости
 RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
+    git \
+    git-lfs \
+    curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && git lfs install
 
 # Копируем файл зависимостей
 COPY requirements.txt .
@@ -16,11 +18,12 @@ COPY requirements.txt .
 # Устанавливаем Python зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код приложения
-COPY main.py .
+# Копируем весь код приложения
+COPY . .
 
-# Копируем модель (убедитесь, что файл находится в той же директории)
-COPY best_model_crf_all.pt .
+# Создаем непривилегированного пользователя
+RUN useradd -m -u 1000 appuser && chown -R appuser:appuser /app
+USER appuser
 
 # Открываем порт
 EXPOSE 8002

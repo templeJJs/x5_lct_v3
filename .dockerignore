@@ -29,3 +29,6 @@ docs/
 .DS_Store
 *.swp
 *.swo
+.idea/
+docker-compose*.yml
+Dockerfile*
