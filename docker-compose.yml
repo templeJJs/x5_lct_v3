@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  ner-server:
+    build: .
+    container_name: ner-api
+    ports:
+      - "8002:8002"
+    environment:
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    volumes:
+      # Опционально: для обновления модели без пересборки образа
+      - ./best_model_crf_all.pt:/app/best_model_crf_all.pt:ro
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+        reservations:
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 300s
