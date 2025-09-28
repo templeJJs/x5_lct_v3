@@ -13,6 +13,9 @@ from queue import Queue
 from datetime import datetime
 import time
 import asyncio
+from asyncio import Queue as AsyncQueue
+from collections import deque
+import threading
 
 # Настройка асинхронного логирования
 log_queue = Queue()
@@ -43,6 +46,10 @@ device = torch.device('cpu')
 # Устанавливаем количество потоков для CPU
 torch.set_num_threads(4)  # Используем все 4 ядра
 logger.info(f"Используем устройство: {device}, потоков: {torch.get_num_threads()}")
+
+# Параметры батчинга
+BATCH_SIZE = 10  # Размер батча для обработки
+BATCH_TIMEOUT = 0.05  # Таймаут в секундах для накопления батча
 
 # Маппинг меток
 label_to_id = {
@@ -145,122 +152,206 @@ def load_model():
 # Глобальные переменные для модели
 model = None
 tokenizer = None
+batch_queue = None
+batch_processor_task = None
+
+
+# ============ Батч процессор ============
+class BatchProcessor:
+    def __init__(self, model, tokenizer, batch_size=8, timeout=0.05):
+        self.model = model
+        self.tokenizer = tokenizer
+        self.batch_size = batch_size
+        self.timeout = timeout
+        self.queue = AsyncQueue()
+
+    async def process_batches(self):
+        """Основной цикл обработки батчей"""
+        while True:
+            batch = []
+            futures = []
+
+            # Накапливаем батч
+            try:
+                # Ждём первый элемент
+                item = await self.queue.get()
+                batch.append(item)
+                futures.append(item['future'])
+
+                # Пытаемся добрать до batch_size или по таймауту
+                deadline = time.time() + self.timeout
+                while len(batch) < self.batch_size and time.time() < deadline:
+                    try:
+                        remaining_time = max(0, deadline - time.time())
+                        item = await asyncio.wait_for(self.queue.get(), timeout=remaining_time)
+                        batch.append(item)
+                        futures.append(item['future'])
+                    except asyncio.TimeoutError:
+                        break
+
+            except Exception as e:
+                logger.error(f"Ошибка в batch processor: {e}")
+                continue
+
+            if batch:
+                try:
+                    # Обрабатываем батч
+                    results = self._process_batch(batch)
+
+                    # Возвращаем результаты
+                    for future, result in zip(futures, results):
+                        if not future.done():
+                            future.set_result(result)
+
+                except Exception as e:
+                    logger.error(f"Ошибка обработки батча: {e}")
+                    for future in futures:
+                        if not future.done():
+                            future.set_exception(e)
+
+    def _process_batch(self, batch_items):
+        """Обработка батча текстов"""
+        texts = [item['text'] for item in batch_items]
+        include_o_flags = [item['include_o'] for item in batch_items]
+
+        # Токенизация батча
+        encodings = self.tokenizer(
+            texts,
+            truncation=True,
+            max_length=MAX_LENGTH,
+            return_offsets_mapping=True,
+            return_tensors='pt',
+            padding=True  # Включаем паддинг для батча
+        )
+
+        input_ids = encodings['input_ids']
+        attention_mask = encodings['attention_mask']
+
+        # Предсказание для батча
+        with torch.no_grad():
+            predictions_batch = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=None
+            )
+
+        # Обработка результатов для каждого текста
+        results = []
+        for idx, (text, include_o) in enumerate(zip(texts, include_o_flags)):
+            predictions = predictions_batch[idx]
+            offset_mapping = encodings['offset_mapping'][idx].tolist()
+
+            # Собираем предсказания для каждого токена
+            token_predictions = []
+            for j, (pred_id, (start, end)) in enumerate(zip(predictions, offset_mapping)):
+                if start == 0 and end == 0:  # Специальные токены
+                    continue
+                if j >= len(predictions):
+                    break
+
+                pred_label = id_to_label[pred_id]
+                token_predictions.append({
+                    'start': start,
+                    'end': end,
+                    'label': pred_label
+                })
+
+            # Группируем по словам и создаём спаны
+            entities = []
+            current_pos = 0
+            words = text.split()
+            previous_entity_type = None
+
+            for word_idx, word in enumerate(words):
+                # Находим позицию слова в тексте
+                word_start = text.find(word, current_pos)
+                if word_start == -1:
+                    continue
+                word_end = word_start + len(word)
+
+                # Находим все токены, которые попадают в диапазон этого слова
+                word_tokens = [
+                    t for t in token_predictions
+                    if t['start'] >= word_start and t['start'] < word_end
+                ]
+
+                if word_tokens:
+                    # Берём метку первого токена слова
+                    word_label = word_tokens[0]['label']
+
+                    if word_label != 'O':
+                        entity_type = word_label[2:] if word_label.startswith(('B-', 'I-')) else word_label
+
+                        # Корректируем B-/I- теги на основе контекста
+                        if previous_entity_type and previous_entity_type == entity_type:
+                            final_label = f'I-{entity_type}'
+                        else:
+                            final_label = f'B-{entity_type}'
+
+                        entities.append({
+                            'start_index': word_start,
+                            'end_index': word_end,
+                            'entity': final_label
+                        })
+                        previous_entity_type = entity_type
+                    else:
+                        # Добавляем O метку если нужно
+                        if include_o:
+                            entities.append({
+                                'start_index': word_start,
+                                'end_index': word_end,
+                                'entity': 'O'
+                            })
+                        previous_entity_type = None
+                else:
+                    # Нет токенов для слова - добавляем O если нужно
+                    if include_o:
+                        entities.append({
+                            'start_index': word_start,
+                            'end_index': word_end,
+                            'entity': 'O'
+                        })
+                    previous_entity_type = None
+
+                current_pos = word_end
+
+            results.append(entities)
+
+        return results
+
+    async def predict(self, text: str, include_o: bool = True):
+        """Добавляет текст в очередь и ждёт результат"""
+        future = asyncio.get_event_loop().create_future()
+        await self.queue.put({
+            'text': text,
+            'include_o': include_o,
+            'future': future
+        })
+        return await future
 
 
 @app.on_event("startup")
 async def startup_event():
     """Загружает модель при старте сервера"""
-    global model, tokenizer
+    global model, tokenizer, batch_queue, batch_processor_task
     model, tokenizer = load_model()
-    logger.info("Сервер готов к работе")
+
+    # Создаём батч процессор
+    batch_processor = BatchProcessor(model, tokenizer, BATCH_SIZE, BATCH_TIMEOUT)
+    batch_queue = batch_processor
+
+    # Запускаем фоновую задачу обработки батчей
+    batch_processor_task = asyncio.create_task(batch_processor.process_batches())
+
+    logger.info(f"Сервер готов к работе. Батчинг: размер={BATCH_SIZE}, таймаут={BATCH_TIMEOUT}с")
 
 
-# ============ Функция предсказания ============
-def predict_entities(text: str, include_o_labels: bool = True) -> List[Dict[str, any]]:
-    """
-    Предсказывает NER метки для текста
-    """
-    if not text:
-        return []
-
-    # Токенизация
-    encoding = tokenizer(
-        text,
-        truncation=True,
-        max_length=MAX_LENGTH,
-        return_offsets_mapping=True,
-        return_tensors='pt',
-        padding=False  # Отключаем паддинг для скорости
-    )
-
-    # Перенос на устройство (CPU)
-    input_ids = encoding['input_ids']
-    attention_mask = encoding['attention_mask']
-
-    # Предсказание (уже в no_grad режиме глобально)
-    predictions = model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        labels=None
-    )[0]
-
-    # Собираем предсказания для каждого токена
-    offset_mapping = encoding['offset_mapping'][0].tolist()
-    token_predictions = []
-
-    for j, (pred_id, (start, end)) in enumerate(zip(predictions, offset_mapping)):
-        if start == 0 and end == 0:  # Специальные токены
-            continue
-        if j >= len(predictions):
-            break
-
-        pred_label = id_to_label[pred_id]
-        token_predictions.append({
-            'start': start,
-            'end': end,
-            'label': pred_label
-        })
-
-    # Группируем по словам и создаём спаны
-    entities = []
-    current_pos = 0
-    words = text.split()
-    previous_entity_type = None
-
-    for word_idx, word in enumerate(words):
-        # Находим позицию слова в тексте
-        word_start = text.find(word, current_pos)
-        if word_start == -1:
-            continue
-        word_end = word_start + len(word)
-
-        # Находим все токены, которые попадают в диапазон этого слова
-        word_tokens = [
-            t for t in token_predictions
-            if t['start'] >= word_start and t['start'] < word_end
-        ]
-
-        if word_tokens:
-            # Берём метку первого токена слова
-            word_label = word_tokens[0]['label']
-
-            if word_label != 'O':
-                entity_type = word_label[2:] if word_label.startswith(('B-', 'I-')) else word_label
-
-                # Корректируем B-/I- теги на основе контекста
-                if previous_entity_type and previous_entity_type == entity_type:
-                    final_label = f'I-{entity_type}'
-                else:
-                    final_label = f'B-{entity_type}'
-
-                entities.append({
-                    'start_index': word_start,
-                    'end_index': word_end,
-                    'entity': final_label
-                })
-                previous_entity_type = entity_type
-            else:
-                # Добавляем O метку если нужно
-                if include_o_labels:
-                    entities.append({
-                        'start_index': word_start,
-                        'end_index': word_end,
-                        'entity': 'O'
-                    })
-                previous_entity_type = None
-        else:
-            # Нет токенов для слова - добавляем O если нужно
-            if include_o_labels:
-                entities.append({
-                    'start_index': word_start,
-                    'end_index': word_end,
-                    'entity': 'O'
-                })
-            previous_entity_type = None
-
-        current_pos = word_end
-
-    return entities
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Останавливаем батч процессор при выключении"""
+    global batch_processor_task
+    if batch_processor_task:
+        batch_processor_task.cancel()
 
 
 # ============ API эндпоинты ============
@@ -276,27 +367,28 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": model is not None,
-        "device": str(device)
+        "device": str(device),
+        "batch_size": BATCH_SIZE,
+        "batch_timeout": BATCH_TIMEOUT
     }
 
 
 @app.post("/api/predict", response_model=List[EntityResponse])
 async def predict(request: PredictRequest):
     """
-    Предсказание NER меток для текста
+    Предсказание NER меток для текста (с батчингом)
     """
-    # Логируем только если включено детальное логирование
     if DETAILED_LOGGING:
         request_start = time.time()
         request_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         logger.info(f"[{request_time}] Запрос получен: text='{request.input[:50]}...', include_o={request.include_o}")
 
     try:
-        if model is None:
+        if model is None or batch_queue is None:
             raise HTTPException(status_code=503, detail="Модель не загружена")
 
-        # Получаем предсказания
-        entities = predict_entities(request.input, request.include_o)
+        # Получаем предсказания через батч процессор
+        entities = await batch_queue.predict(request.input, request.include_o)
 
         # Преобразуем в формат ответа
         response = [
@@ -309,7 +401,6 @@ async def predict(request: PredictRequest):
         ]
 
         if DETAILED_LOGGING:
-            # Логируем время окончания и длительность
             request_end = time.time()
             duration_ms = (request_end - request_start) * 1000
             response_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
@@ -323,27 +414,6 @@ async def predict(request: PredictRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/api/predict_batch")
-async def predict_batch(texts: List[str], include_o: bool = True):
-    """
-    Батчевое предсказание для нескольких текстов
-    """
-    try:
-        if model is None:
-            raise HTTPException(status_code=503, detail="Модель не загружена")
-
-        results = []
-        for text in texts:
-            entities = predict_entities(text, include_o)
-            results.append(entities)
-
-        return results
-
-    except Exception as e:
-        logger.error(f"Ошибка при батчевом предсказании: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
 # ============ Запуск сервера ============
 if __name__ == "__main__":
     try:
@@ -352,8 +422,8 @@ if __name__ == "__main__":
             host="0.0.0.0",
             port=8002,
             reload=False,
-            log_level="warning",  # Изменено с "info" на "warning" для меньшего спама
-            access_log=False,  # Отключаем access логи для скорости
+            log_level="warning",
+            access_log=False,
             use_colors=False,
             workers=1
         )
