@@ -20,7 +20,7 @@ services:
           memory: 2G
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
-      interval: 30s
+      interval: 40s
       timeout: 10s
-      retries: 3
+      retries: 2
       start_period: 300s

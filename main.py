@@ -8,20 +8,27 @@ from pydantic import BaseModel
 from typing import List, Dict
 import uvicorn
 import logging
+from datetime import datetime
+import time
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format='%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s',
+    datefmt='%Y-%m-%d %H:%M:%S',
     handlers=[
         logging.StreamHandler()
     ]
 )
 logger = logging.getLogger(__name__)
 
+
 # ============ Конфигурация ============
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-logger.info(f"Используем устройство: {device}")
+# ВАЖНО: отключаем CUDA для 4-ядерного CPU
+device = torch.device('cpu')
+# Устанавливаем количество потоков для CPU
+torch.set_num_threads(4)  # Используем все 4 ядра
+logger.info(f"Используем устройство: {device}, потоков: {torch.get_num_threads()}")
 
 # Маппинг меток
 label_to_id = {
@@ -40,7 +47,7 @@ id_to_label = {v: k for k, v in label_to_id.items()}
 # Параметры модели
 MODEL_NAME = "DeepPavlov/rubert-base-cased"
 MAX_LENGTH = 20
-MODEL_PATH = "best_model_crf.pt"
+MODEL_PATH = "best_model_crf_all.pt"
 
 
 # ============ Модель BertCRF ============
@@ -72,7 +79,7 @@ class BertCRFForNER(nn.Module):
 # ============ Pydantic модели ============
 class PredictRequest(BaseModel):
     input: str
-    include_o: bool = True  # По умолчанию включаем O метки
+    include_o: bool = True
 
 
 class EntityResponse(BaseModel):
@@ -93,74 +100,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-'''
-# ============ Загрузка модели ============
+
 def load_model():
     """Загружает модель и токенайзер"""
-    try:
-        logger.info("Загрузка токенайзера...")
-        tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    start_time = time.time()
 
-        logger.info("Инициализация модели...")
-        #model = BertCRFForNER(MODEL_NAME, num_labels=len(label_to_id))
-
-        #logger.info(f"Загрузка весов из {MODEL_PATH}...")
-        #checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
-
-        checkpoint = torch.load(MODEL_PATH, map_location=device)
-        model = BertCRFForNER("DeepPavlov/rubert-base-cased", num_labels=len(label_to_id))
-        model.load_state_dict(checkpoint['model_state_dict'])
-
-        # Обработка разных форматов checkpoint
-        if 'model_state_dict' in checkpoint:
-            model.load_state_dict(checkpoint['model_state_dict'])
-            logger.info(f"Модель загружена с эпохи {checkpoint.get('epoch', 'unknown')}")
-        else:
-            model.load_state_dict(checkpoint)
-            logger.info("Модель загружена")
-
-        model.to(device)
-        model.eval()
-
-        return model, tokenizer
-    except Exception as e:
-        logger.error(f"Ошибка при загрузке модели: {e}")
-        raise
-'''
-
-'''
-def load_model():
-    # Загружаем токенайзер (он маленький, можно и из сети)
-    print('Загружаем tokenizer ')
-    tokenizer = AutoTokenizer.from_pretrained("DeepPavlov/rubert-base-cased")
-    print('Загружаем модель ')
-    # Загружаем ВСЮ модель
-    print('загружаем модель')
-    checkpoint = torch.load('best_model_crf_all.pt', map_location=device)
-    #model = checkpoint['model']
-    print('грузим чекпоинт')
-    model = checkpoint['model_state_dict']
-    print('хуй')
-    model.to(device)
-    model.eval()
-
-    return model, tokenizer
-'''
-
-def load_model():
     # Токенайзер
-    tokenizer = AutoTokenizer.from_pretrained("DeepPavlov/rubert-base-cased")
+    logger.info("Загружаем токенайзер...")
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     # Загружаем checkpoint
-    checkpoint = torch.load('best_model_crf_all.pt', map_location=device, weights_only=False)
+    logger.info(f"Загружаем модель из {MODEL_PATH}...")
+    checkpoint = torch.load(MODEL_PATH, map_location=device, weights_only=False)
 
-    # Достаём модель (хоть она и под неправильным ключом)
-    model = checkpoint['model_state_dict']  # Это МОДЕЛЬ, а не state_dict!
+    # Достаём модель
+    model = checkpoint['model_state_dict']
 
     model.to(device)
     model.eval()
 
+    # Включаем режим inference для ускорения
+    torch.set_grad_enabled(False)
+
+    load_time = time.time() - start_time
+    logger.info(f"Модель загружена за {load_time:.2f} секунд")
+
     return model, tokenizer
+
 
 # Глобальные переменные для модели
 model = None
@@ -179,13 +145,6 @@ async def startup_event():
 def predict_entities(text: str, include_o_labels: bool = True) -> List[Dict[str, any]]:
     """
     Предсказывает NER метки для текста
-
-    Args:
-        text: входной текст
-        include_o_labels: включать ли O метки в результат
-
-    Returns:
-        Список словарей с позициями и метками сущностей
     """
     if not text:
         return []
@@ -196,20 +155,20 @@ def predict_entities(text: str, include_o_labels: bool = True) -> List[Dict[str,
         truncation=True,
         max_length=MAX_LENGTH,
         return_offsets_mapping=True,
-        return_tensors='pt'
+        return_tensors='pt',
+        padding=False  # Отключаем паддинг для скорости
     )
 
-    # Перенос на устройство
-    input_ids = encoding['input_ids'].to(device)
-    attention_mask = encoding['attention_mask'].to(device)
+    # Перенос на устройство (CPU)
+    input_ids = encoding['input_ids']
+    attention_mask = encoding['attention_mask']
 
-    # Предсказание
-    with torch.no_grad():
-        predictions = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=None
-        )[0]  # Берём первый элемент батча
+    # Предсказание (уже в no_grad режиме глобально)
+    predictions = model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        labels=None
+    )[0]
 
     # Собираем предсказания для каждого токена
     offset_mapping = encoding['offset_mapping'][0].tolist()
@@ -311,29 +270,19 @@ async def health_check():
 async def predict(request: PredictRequest):
     """
     Предсказание NER меток для текста
-
-    Args:
-        request: объект с полем input содержащим текст и include_o для включения O меток
-
-    Returns:
-        Список сущностей с их позициями и метками
     """
+    # Логируем время начала запроса
+    request_start = time.time()
+    request_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
     try:
-        # Логируем входящий запрос
-        #logger.info(f"Получен запрос: input='{request}', include_o={request.include_o}")
-        #print(f"PRINT: Получен запрос: {request}")  # Для отладки
-        logger.info(f"Получен запрос: {request.dict()}")
-        # В лог — как JSON-строка
-        logger.info(f"Получен запрос (json): {request.json()}")
+        logger.info(f"[{request_time}] Запрос получен: text='{request.input[:50]}...', include_o={request.include_o}")
 
         if model is None:
             raise HTTPException(status_code=503, detail="Модель не загружена")
 
         # Получаем предсказания
         entities = predict_entities(request.input, request.include_o)
-
-        # Логируем результат
-        logger.info(f"Результат: найдено {len(entities)} сущностей")
 
         # Преобразуем в формат ответа
         response = [
@@ -344,6 +293,14 @@ async def predict(request: PredictRequest):
             )
             for entity in entities
         ]
+
+        # Логируем время окончания и длительность
+        request_end = time.time()
+        duration_ms = (request_end - request_start) * 1000
+        response_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+        logger.info(
+            f"[{response_time}] Ответ отправлен: найдено {len(entities)} сущностей, время обработки: {duration_ms:.1f}ms")
 
         return response
 
@@ -356,13 +313,6 @@ async def predict(request: PredictRequest):
 async def predict_batch(texts: List[str], include_o: bool = True):
     """
     Батчевое предсказание для нескольких текстов
-
-    Args:
-        texts: список текстов
-        include_o: включать ли O метки в результат
-
-    Returns:
-        Список результатов для каждого текста
     """
     try:
         if model is None:
@@ -389,5 +339,6 @@ if __name__ == "__main__":
         reload=False,
         log_level="info",
         access_log=True,
-        use_colors=False
+        use_colors=False,
+        workers=1  # Один воркер для избежания дублирования модели в памяти
     )
