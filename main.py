@@ -8,20 +8,34 @@ from pydantic import BaseModel
 from typing import List, Dict
 import uvicorn
 import logging
+from logging.handlers import QueueHandler, QueueListener
+from queue import Queue
 from datetime import datetime
 import time
+import asyncio
 
-# Настройка логирования
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S',
-    handlers=[
-        logging.StreamHandler()
-    ]
+# Настройка асинхронного логирования
+log_queue = Queue()
+queue_handler = QueueHandler(log_queue)
+
+# Обработчик который пишет в stdout
+stream_handler = logging.StreamHandler()
+stream_handler.setFormatter(
+    logging.Formatter('%(asctime)s.%(msecs)03d - %(name)s - %(levelname)s - %(message)s',
+                      datefmt='%Y-%m-%d %H:%M:%S')
 )
-logger = logging.getLogger(__name__)
 
+# Слушатель очереди (работает в отдельном потоке)
+queue_listener = QueueListener(log_queue, stream_handler)
+queue_listener.start()
+
+# Настраиваем логгер
+logger = logging.getLogger(__name__)
+logger.addHandler(queue_handler)
+logger.setLevel(logging.INFO)
+
+# Флаг для включения/выключения детального логирования
+DETAILED_LOGGING = False  # Поставь True если нужна отладка
 
 # ============ Конфигурация ============
 # ВАЖНО: отключаем CUDA для 4-ядерного CPU
@@ -271,13 +285,13 @@ async def predict(request: PredictRequest):
     """
     Предсказание NER меток для текста
     """
-    # Логируем время начала запроса
-    request_start = time.time()
-    request_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-
-    try:
+    # Логируем только если включено детальное логирование
+    if DETAILED_LOGGING:
+        request_start = time.time()
+        request_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
         logger.info(f"[{request_time}] Запрос получен: text='{request.input[:50]}...', include_o={request.include_o}")
 
+    try:
         if model is None:
             raise HTTPException(status_code=503, detail="Модель не загружена")
 
@@ -294,13 +308,13 @@ async def predict(request: PredictRequest):
             for entity in entities
         ]
 
-        # Логируем время окончания и длительность
-        request_end = time.time()
-        duration_ms = (request_end - request_start) * 1000
-        response_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
-
-        logger.info(
-            f"[{response_time}] Ответ отправлен: найдено {len(entities)} сущностей, время обработки: {duration_ms:.1f}ms")
+        if DETAILED_LOGGING:
+            # Логируем время окончания и длительность
+            request_end = time.time()
+            duration_ms = (request_end - request_start) * 1000
+            response_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+            logger.info(
+                f"[{response_time}] Ответ отправлен: найдено {len(entities)} сущностей, время обработки: {duration_ms:.1f}ms")
 
         return response
 
@@ -332,13 +346,17 @@ async def predict_batch(texts: List[str], include_o: bool = True):
 
 # ============ Запуск сервера ============
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host="0.0.0.0",
-        port=8002,
-        reload=False,
-        log_level="info",
-        access_log=True,
-        use_colors=False,
-        workers=1  # Один воркер для избежания дублирования модели в памяти
-    )
+    try:
+        uvicorn.run(
+            "main:app",
+            host="0.0.0.0",
+            port=8002,
+            reload=False,
+            log_level="warning",  # Изменено с "info" на "warning" для меньшего спама
+            access_log=False,  # Отключаем access логи для скорости
+            use_colors=False,
+            workers=1
+        )
+    finally:
+        # Останавливаем listener при выходе
+        queue_listener.stop()
