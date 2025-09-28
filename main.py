@@ -320,8 +320,11 @@ async def predict(request: PredictRequest):
     """
     try:
         # Логируем входящий запрос
-        logger.info(f"Получен запрос: input='{request}', include_o={request.include_o}")
-        print(f"PRINT: Получен запрос: {request}")  # Для отладки
+        #logger.info(f"Получен запрос: input='{request}', include_o={request.include_o}")
+        #print(f"PRINT: Получен запрос: {request}")  # Для отладки
+        logger.info(f"Получен запрос: {request.dict()}")
+        # В лог — как JSON-строка
+        logger.info(f"Получен запрос (json): {request.json()}")
 
         if model is None:
             raise HTTPException(status_code=503, detail="Модель не загружена")
