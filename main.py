@@ -10,7 +10,13 @@ import uvicorn
 import logging
 
 # Настройка логирования
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler()
+    ]
+)
 logger = logging.getLogger(__name__)
 
 # ============ Конфигурация ============
@@ -313,11 +319,18 @@ async def predict(request: PredictRequest):
         Список сущностей с их позициями и метками
     """
     try:
+        # Логируем входящий запрос
+        logger.info(f"Получен запрос: input='{request}', include_o={request.include_o}")
+        print(f"PRINT: Получен запрос: {request}")  # Для отладки
+
         if model is None:
             raise HTTPException(status_code=503, detail="Модель не загружена")
 
         # Получаем предсказания
         entities = predict_entities(request.input, request.include_o)
+
+        # Логируем результат
+        logger.info(f"Результат: найдено {len(entities)} сущностей")
 
         # Преобразуем в формат ответа
         response = [
@@ -367,9 +380,11 @@ async def predict_batch(texts: List[str], include_o: bool = True):
 # ============ Запуск сервера ============
 if __name__ == "__main__":
     uvicorn.run(
-        "main:app",  # Измените на имя вашего файла
+        "main:app",
         host="0.0.0.0",
         port=8002,
         reload=False,
-        log_level="info"
+        log_level="info",
+        access_log=True,
+        use_colors=False
     )

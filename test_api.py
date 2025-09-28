@@ -2,7 +2,7 @@ import requests
 import json
 
 # URL сервера
-BASE_URL = "http://localhost:8002"
+BASE_URL = "http://217.114.3.51:8002"
 
 
 def test_predict():
